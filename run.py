@@ -37,7 +37,9 @@ from tqdm import tqdm
 
 
 SYSTEMS = [
+    "gb",
     "gba",
+    "gbc",
     "snes",
 ]
 
