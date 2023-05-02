@@ -1,0 +1,10 @@
+cache/*.key
+cache/*.metadata
+cache/*.value
+data/games/*.json
+guides/*.key
+guides/*.metadata
+guides/*.value
+logs/*.log
+
+data/*.json
