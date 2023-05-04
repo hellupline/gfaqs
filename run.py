@@ -8,6 +8,7 @@ import mimetypes
 import zipfile
 
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -37,7 +38,7 @@ from tqdm import tqdm
 
 
 SYSTEMS = [
-    "gb",
+    "gameboy",
     "gba",
     "gbc",
     "snes",
@@ -118,7 +119,7 @@ class Release:
     region: str
     publisher: Publisher
     product_id: str
-    release_date: date
+    release_date: Union[date, str]
 
 
 @dataclass()
@@ -168,6 +169,7 @@ class GuideGame:
 @dataclass()
 class Game:
     url: str = field(repr=False)
+    slug: str
     name: str
     description: str = field(repr=False)
     platform: list[Platform] = field(default_factory=list)
@@ -199,7 +201,7 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
                 continue
             game = get_game(game_url)
             download_guides(game)
-            with (game_data_path / f"{game.name}.json").open(mode="wt", encoding="utf-8") as f:
+            with (game_data_path / f"{game.slug}.json").open(mode="wt", encoding="utf-8") as f:
                 json.dump(asdict(game), f, cls=DateTimeEncoder)
 
 
@@ -219,11 +221,12 @@ def get_games_urls(url) -> set[str]:
 
 
 def get_game(url: str) -> Game:
-    name = Path(urlparse(url).path).name
+    slug = Path(urlparse(url).path).name
     text = cached_fetch_text(url)
     q = PyQuery(text).make_links_absolute(base_url=f"{url}/")
+    name = q("div.header_right h1.page-title").text()
     description = q("div.content div.game_desc").text()
-    game = Game(url=url, name=name, description=description)
+    game = Game(url=url, slug=slug, name=name, description=description)
     _get_game_fields(q, game)
     game.releases = _get_game_releases(f"{url}/data")
     game.guides = _get_game_guides(f"{url}/faqs")
@@ -273,14 +276,8 @@ def _get_game_release_detail(first_row: PyQuery, second_row: PyQuery) -> Release
     publisher_name = publisher_q.text()
     product_id = product_id_tag.text()
     release_date_str = release_date_tag.text()
-    try:
-        release_date = datetime.strptime(release_date_str, "%m/%d/%y").date()
-    except ValueError:
-        try:
-            release_date = datetime.strptime(release_date_str, "%B %Y").date()
-        except ValueError:
-            release_date = datetime.strptime(release_date_str, "%Y").date()
     publisher = Publisher(publisher_url, publisher_name)
+    release_date = _parse_date(release_date_str)
     return Release(
         title=title,
         region=region,
@@ -288,6 +285,18 @@ def _get_game_release_detail(first_row: PyQuery, second_row: PyQuery) -> Release
         product_id=product_id,
         release_date=release_date,
     )
+
+
+def _parse_date(value: str) -> Union[date, str]:
+    with suppress(ValueError):
+        return datetime.strptime(value, "%m/%d/%y").date()
+    with suppress(ValueError):
+        return datetime.strptime(value, "%B %Y").date()
+    with suppress(ValueError):
+        return datetime.strptime(value, "%Y").date()
+    if value == "TBA":
+        return value
+    raise ValueError(f"unknown date value '{value}'")
 
 
 def _get_game_guides(url: str) -> list[GuideGame]:
