@@ -1,33 +1,51 @@
 #!/usr/bin/env python3
 
 import hashlib
-import io
 import json
 import logging
 import mimetypes
+import random
 import zipfile
 
+from collections.abc import AsyncGenerator
+from collections.abc import Generator
 from collections.abc import Iterable
+from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import date
 from datetime import datetime
+from enum import Enum
 from functools import cached_property
+from io import BytesIO
+from operator import attrgetter
 from pathlib import Path
-from typing import Any
+from time import sleep
 from typing import Optional
+from typing import Protocol
+from typing import Self
 from typing import Union
-from urllib.parse import urlencode
 from urllib.parse import urlparse
-from urllib.parse import urlunparse
 
 import click
 import magic
-import requests
+import uvicorn
 
+from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from jinja2 import DictLoader
+from jinja2 import Environment
 from pyquery import PyQuery
+from requests import HTTPError
+from requests import Response
+from requests_cache import NEVER_EXPIRE
+from requests_cache import CachedResponse
+from requests_cache import CachedSession
 from tenacity import after_log
 from tenacity import before_log
 from tenacity import retry
@@ -37,27 +55,9 @@ from tenacity import wait_fixed
 from tqdm import tqdm
 
 
-SYSTEMS = [
-    "gameboy",
-    "gba",
-    "gbc",
-    "snes",
-]
+T_Params = Optional[dict[str, Union[str, int]]]
 
-cache_path = Path("cache")
-game_data_path = Path("data/games")
-guides_path = Path("guides")
-logs_path = Path("logs")
-logs_path.mkdir(parents=True, exist_ok=True)
-
-log_format = "[%(asctime)s:%(levelname)s] %(message)s"
-log_datefmt = "%Y-%m-%dT%H:%M:%S%z"
-log_filename = logs_path / "{:%Y-%m-%dT%H:%M:%S}.log".format(datetime.now())
-logging.basicConfig(format=log_format, datefmt=log_datefmt, filename=log_filename)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
-
-headers = {
+DEFAULT_HEADERS = {
     "user-agent": (
         "Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -66,21 +66,68 @@ headers = {
     "accept": "text/html",
     "accept-language": "en-US,en;q=0.8",
 }
-session = requests.Session()
-session.headers.update(headers)
+
+
+storage_path = Path("data/storage")
+storage_path.mkdir(parents=True, exist_ok=True)
+games_path = Path("data/games")
+games_path.mkdir(parents=True, exist_ok=True)
+logs_path = Path("logs")
+logs_path.mkdir(parents=True, exist_ok=True)
+
+log_format = "[%(asctime)s:%(levelname)s] %(message)s"
+log_datefmt = "%Y-%m-%dT%H:%M:%S%z"
+log_filename = logs_path / "{:%Y-%m-%dT%H:%M:%S}.log".format(datetime.now())
+logging.basicConfig(format=log_format, datefmt=log_datefmt, filename=log_filename)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 mime_database = magic.Magic(mime=True)
 
 
-class CacheMiss(Exception):
-    pass
+@asynccontextmanager
+async def app_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    del app
+    global CONTENT_INDEX_HASH, GAMES_LIST, GAMES_INDEX_SLUG
+    CONTENT_INDEX_HASH = {key: (kind, items) for key, kind, items in load_content_list()}
+    GAMES_LIST = load_games_list()
+    GAMES_INDEX_SLUG = {game.slug: game for game in GAMES_LIST}
+    yield
+
+
+app = FastAPI(lifespan=app_lifespan)
+app.mount(
+    "/data/guides/",
+    StaticFiles(directory=storage_path),
+    name="data_storage",
+)
 
 
 class DateTimeEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, (datetime, date)):
-            return obj.isoformat()
-        return json.JSONEncoder.default(self, obj)
+    def default(self, o):
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        return json.JSONEncoder.default(self, o)
+
+
+class WithName(Protocol):
+    name: str
+
+
+class GuideType(Enum):
+    HTML = "html"
+    TXT = "txt"
+    IMG = "img"
+    ZIP = "zip"
+
+
+class GameSystem(Enum):
+    ds = "ds"
+    gameboy = "gameboy"
+    gba = "gba"
+    gbc = "gbc"
+    n64 = "n64"
+    snes = "snes"
 
 
 @dataclass()
@@ -129,7 +176,7 @@ class GuideAuthor:
 
 
 @dataclass()
-class _Guide:
+class Guide:
     platform: str
     url: str = field(repr=False)
     name: str
@@ -137,21 +184,6 @@ class _Guide:
     flairs: list[str] = field(repr=False)
     notes: str = field(repr=False)
     status: str = field(repr=False)
-    key: str = field(repr=False, init=False)
-
-
-class Guide(_Guide):
-    platform: str
-    url: str = field(repr=False)
-    name: str
-    author: GuideAuthor
-    flairs: list[str] = field(repr=False)
-    notes: str = field(repr=False)
-    status: str = field(repr=False)
-
-    @cached_property
-    def key(self) -> str:  # type: ignore
-        return get_cache_key(self.url)
 
 
 @dataclass()
@@ -172,93 +204,307 @@ class Game:
     slug: str
     name: str
     description: str = field(repr=False)
+    alternative_names: list[str] = field(default_factory=list)
     platform: list[Platform] = field(default_factory=list)
     genre: list[Genre] = field(default_factory=list)
     developer: list[Developer] = field(default_factory=list)
     publisher: list[Publisher] = field(default_factory=list)
     franchises: list[Franchise] = field(default_factory=list)
-    alternative_names: list[str] = field(default_factory=list)
     releases: list[Release] = field(default_factory=list)
     guides: list[GuideGame] = field(default_factory=list)
 
+    @classmethod
+    def from_file(cls: type[Self], path: Path) -> Self:
+        with path.open(mode="rt", encoding="utf-8") as f:
+            content = json.load(f)
+        return cls(
+            url=content["url"],
+            slug=content["slug"],
+            name=content["name"],
+            description=content["description"],
+            alternative_names=content["alternative_names"],
+            platform=[
+                Platform(
+                    url=platform["url"],
+                    name=platform["name"],
+                )
+                for platform in content["platform"]
+            ],
+            genre=[
+                Genre(
+                    url=genre["url"],
+                    name=genre["name"],
+                )
+                for genre in content["genre"]
+            ],
+            developer=[
+                Developer(
+                    url=developer["url"],
+                    name=developer["name"],
+                )
+                for developer in content["developer"]
+            ],
+            publisher=[
+                Publisher(
+                    url=publisher["url"],
+                    name=publisher["name"],
+                )
+                for publisher in content["publisher"]
+            ],
+            franchises=[
+                Franchise(
+                    url=franchise["url"],
+                    name=franchise["name"],
+                )
+                for franchise in content["franchises"]
+            ],
+            releases=[
+                Release(
+                    title=release["title"],
+                    region=release["region"],
+                    publisher=Publisher(
+                        url=release["publisher"]["url"],
+                        name=release["publisher"]["name"],
+                    ),
+                    product_id=release["product_id"],
+                    release_date=_try_date(release["release_date"]),
+                )
+                for release in content["releases"]
+            ],
+            guides=[
+                GuideGame(
+                    name=guide_game["name"],
+                    sections=[
+                        GuideSection(
+                            name=guide_section["name"],
+                            guides=[
+                                Guide(
+                                    platform=guide["platform"],
+                                    url=guide["url"],
+                                    name=guide["name"],
+                                    author=GuideAuthor(
+                                        url=guide["author"]["url"],
+                                        name=guide["author"]["name"],
+                                    ),
+                                    flairs=guide["flairs"],
+                                    notes=guide["notes"],
+                                    status=guide["status"],
+                                )
+                                for guide in guide_section["guides"]
+                            ],
+                        )
+                        for guide_section in guide_game["sections"]
+                    ],
+                )
+                for guide_game in content["guides"]
+            ],
+        )
 
-@click.group(invoke_without_command=True)
+    @cached_property
+    def first_release_date(self) -> date:
+        if not self.releases:
+            return date.max
+        return min(map(_release_date, self.releases))
+
+
+@click.group(invoke_without_command=False)
 def cli() -> None:
-    cache_path.mkdir(parents=True, exist_ok=True)
-    game_data_path.mkdir(parents=True, exist_ok=True)
-    guides_path.mkdir(parents=True, exist_ok=True)
+    ...
+
+
+@cli.command("webapp")
+@click.option("--host", "host", type=str, default="0.0.0.0")
+@click.option("--port", "port", type=int, default=8000)
+def cli_webapp(host: str, port: int) -> None:
+    uvicorn.run(app, host=host, port=port)
 
 
 @cli.command("download")
-@click.option("--system-name", "system_names", type=click.Choice(SYSTEMS), multiple=True, required=True)
-@click.option("--game-name", "game_names", type=click.STRING, multiple=True, required=True)
+@click.option(
+    "--system-name",
+    "system_names",
+    type=click.Choice([e.value for e in GameSystem]),
+    multiple=True,
+    required=True,
+)
+@click.option(
+    "--game-name",
+    "game_names",
+    type=click.STRING,
+    multiple=True,
+    required=True,
+)
 def cli_download(system_names: list[str], game_names: list[str]) -> None:
-    for system_name in system_names:
-        system_url = f"https://gamefaqs.gamespot.com/{system_name}/category/999-all"
-        urls = sorted(get_games_urls(system_url))
-        for game_url in tqdm(urls, desc=f"Downloading {system_name} games data", ncols=120):
-            if game_names and not any(name in game_url for name in game_names):
-                continue
-            game = get_game(game_url)
-            download_guides(game)
-            with (game_data_path / f"{game.slug}.json").open(mode="wt", encoding="utf-8") as f:
-                json.dump(asdict(game), f, cls=DateTimeEncoder)
+    with CachedSession(
+        "requests_cache",
+        expire_after=NEVER_EXPIRE,
+        allowable_codes=[200, 404],
+        allowable_methods=["GET"],
+    ) as session:
+        session.headers.update(DEFAULT_HEADERS)
+        _download_guide_item(
+            session,
+            url="https://gamefaqs.gamespot.com/ds/920760-metroid-prime-hunters/faqs/78897",
+        )
+        # for game_system in map(GameSystem, system_names):
+        #     url = f"https://gamefaqs.gamespot.com/{game_system.value}/category/999-all"
+        #     for url in tqdm(
+        #         sorted(get_games_urls(session, url)),
+        #         desc=f"Downloading {game_system.value} guides",
+        #         leave=True,
+        #         ncols=120,
+        #     ):
+        #         if game_names and not any(name in url for name in game_names):
+        #             continue
+        #         game = get_game(session, url)
+        #         download_guides(session, game)
+        #         with (games_path / f"{game.slug}.json").open(mode="wt", encoding="utf-8") as f:
+        #             json.dump(asdict(game), f, cls=DateTimeEncoder)
 
 
-def get_games_urls(url) -> set[str]:
-    text = cached_fetch_text(url, params={"page": 0})
-    q = PyQuery(text).make_links_absolute(base_url=f"{url}/")
+@app.get("/", response_class=RedirectResponse)
+def root():
+    return app.url_path_for("games_list")
+
+
+@app.get("/games", response_class=HTMLResponse)
+def games_list() -> str:
+    tpl = template_environment.get_template("games_list.html")
+    return tpl.render(games=GAMES_LIST)
+
+
+@app.get("/games/{slug:str}", response_class=HTMLResponse)
+def game_detail(slug: str) -> str:
+    game = GAMES_INDEX_SLUG[slug]
+    _, game_slug = game.slug.split("-", maxsplit=1)
+    tpl = template_environment.get_template("game_detail.html")
+    return tpl.render(game=game, game_slug=game_slug)
+
+
+@app.get("/games/{slug:str}/guide/{key:str}", response_class=HTMLResponse)
+def game_guide(slug: str, key: str) -> str:
+    game = GAMES_INDEX_SLUG[slug]
+    for guide_game in game.guides:
+        for guide_section in guide_game.sections:
+            for guide in guide_section.guides:
+                guide_type, item = CONTENT_INDEX_HASH[key]
+                match guide_type:
+                    case GuideType.ZIP:
+                        return "ZIP"
+                    case GuideType.HTML:
+                        tpl = template_environment.get_template("game_guide_html_toc.html")
+                        text = item.read_text(encoding="utf-8")
+                        q = PyQuery(text)
+                        for tag in q("a"):
+                            if "href" not in tag.attrib:
+                                continue
+                            item_key = Path(tag.attrib["href"]).parent.stem
+                            url = app.url_path_for("game_guide", slug=slug, key=item_key)
+                            tag.attrib["href"] = url
+                        html = q.html(method="html")
+                        return tpl.render(guide=guide, toc=html)
+                    case GuideType.IMG:
+                        tpl = template_environment.get_template("game_guide_img.html")
+                        path = item.relative_to(storage_path)
+                        url = app.url_path_for("data_storage", path=str(path))
+                        return tpl.render(guide=guide, url=url)
+                    case GuideType.TXT:
+                        tpl = template_environment.get_template("game_guide_txt.html")
+                        text = item.read_text(encoding="utf-8")
+                        return tpl.render(guide=guide, text=text)
+                    case _:
+                        raise ValueError(f"Unknown guide type for {key}")
+    raise HTTPException(status_code=404, detail="Guide not found")
+
+
+def load_content_list() -> Generator[tuple[str, GuideType, Path], None, None]:
+    for path in storage_path.glob("*.key"):
+        key = path.stem
+        guide_path = storage_path / f"{key}.value"
+        if (filename := (guide_path / "data.html")).exists():
+            yield (key, GuideType.HTML, filename)
+        elif (filename := (guide_path / "data.png")).exists():
+            yield (key, GuideType.IMG, filename)
+        elif (filename := (guide_path / "data.jpg")).exists():
+            yield (key, GuideType.IMG, filename)
+        elif (filename := (guide_path / "data.gif")).exists():
+            yield (key, GuideType.IMG, filename)
+        elif (filename := (guide_path / "data.txt")).exists():
+            yield (key, GuideType.TXT, filename)
+        elif (filename := (guide_path / "data.zip")).exists():
+            yield (key, GuideType.ZIP, filename)
+        # else:
+        #     raise ValueError(f"Unknown guide type for {key}")
+
+
+def load_games_list() -> list[Game]:
+    return sorted(
+        (Game.from_file(path) for path in games_path.rglob("*.json")),
+        key=attrgetter("first_release_date", "name"),
+        reverse=True,
+    )
+
+
+def get_games_urls(session: CachedSession, url: str) -> set[str]:
+    r = _request(session, url=url, params={"page": 0})
+    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
     search = "table.results tbody tr td.rtitle a:not(.cancel)"
-    items = q(search)
-    item_urls = {t.attrib["href"] for t in items}
+    urls = {t.attrib["href"] for t in q(search)}
     last_page = max(int(t.attrib.get("value", -1)) for t in q("select#pagejump option"))
     for page in range(1, last_page + 1):
-        text = cached_fetch_text(url, params={"page": page})
-        q = PyQuery(text).make_links_absolute(base_url=f"{url}/")
-        items = q(search)
-        item_urls.update(t.attrib["href"] for t in items)
-    return item_urls
+        r = _request(session, url=url, params={"page": page})
+        q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+        urls.update({t.attrib["href"] for t in q(search)})
+    return urls
 
 
-def get_game(url: str) -> Game:
-    slug = Path(urlparse(url).path).name
-    text = cached_fetch_text(url)
-    q = PyQuery(text).make_links_absolute(base_url=f"{url}/")
-    name = q("div.header_right h1.page-title").text()
-    description = q("div.content div.game_desc").text()
+def get_game(session: CachedSession, url: str) -> Game:
+    r = _request(session, url=url)
+    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+    slug: str = Path(urlparse(url).path).name
+    name: str = q("div.header_right h1.page-title").text()  # type: ignore
+    description: str = q("div.content div.game_desc").text()  # type: ignore
     game = Game(url=url, slug=slug, name=name, description=description)
     _get_game_fields(q, game)
-    game.releases = _get_game_releases(f"{url}/data")
-    game.guides = _get_game_guides(f"{url}/faqs")
+    game.releases = _get_game_releases(session, url=f"{url}/data")
+    game.guides = _get_game_guides(session, f"{url}/faqs")
     return game
 
 
 def _get_game_fields(q: PyQuery, game: Game) -> None:
-    data: dict[str, list[tuple[str, str]]] = {}
-    aka_value: list[str] = []
+    data: dict[str, list[tuple[str, str]]]
+    data = {
+        "Platform": [],
+        "Genre": [],
+        "Developer": [],
+        "Publisher": [],
+        "Franchises": [],
+    }
+    aka_value = []
     for item in map(PyQuery, q("div.pod_gameinfo ol li div.content")):
-        key = item("b").text().removesuffix(":")
-        if key == "Also Known As":
-            aka_value = [t.text.removeprefix("• ") for t in item("i")]
-        else:
-            value: list[tuple[str, str]] = [(t.attrib["href"], t.text) for t in item("a")]  # type: ignore
-            if key == "Developer/Publisher":
-                data["Developer"] = value
-                data["Publisher"] = value
-            data[key] = value
+        key: str = item("b").text().removesuffix(":")  # type: ignore
+        match key:
+            case "Also Known As":
+                aka_value = [t.text.removeprefix("• ") for t in item("i")]
+            case "Developer/Publisher":
+                value = [(t.attrib["href"], t.text) for t in item("a")]  # type: ignore
+                data["Developer"] = data["Publisher"] = value
+            case _:
+                value = [(t.attrib["href"], t.text) for t in item("a")]  # type: ignore
+                data[key] = value
+    game.alternative_names = aka_value
     game.platform = [Platform(url, name) for url, name in data["Platform"]]
     game.genre = [Genre(url, name) for url, name in data["Genre"]]
     game.developer = [Developer(url, name) for url, name in data["Developer"]]
     game.publisher = [Publisher(url, name) for url, name in data["Publisher"]]
     game.franchises = [Franchise(url, name) for url, name in data["Franchises"]]
-    game.alternative_names = aka_value
 
 
-def _get_game_releases(url) -> list[Release]:
-    text = cached_fetch_text(url)
-    q = PyQuery(text).make_links_absolute(base_url=f"{url}/")
+def _get_game_releases(session: CachedSession, url: str) -> list[Release]:
+    r = _request(session, url=url)
+    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
     items_q = q("div.gdata div.body table tbody tr")
-    _, *items = unflatten(map(PyQuery, items_q), size=2)
+    _, *items = _unflatten(map(PyQuery, items_q), size=2)
     releases = []
     for first_row, second_row in items:
         release = _get_game_release_detail(first_row("td"), second_row("td"))
@@ -276,48 +522,36 @@ def _get_game_release_detail(first_row: PyQuery, second_row: PyQuery) -> Release
     publisher_name = publisher_q.text()
     product_id = product_id_tag.text()
     release_date_str = release_date_tag.text()
-    publisher = Publisher(publisher_url, publisher_name)
-    release_date = _parse_date(release_date_str)
+    publisher = Publisher(publisher_url, publisher_name)  # type: ignore
+    release_date = _parse_date(release_date_str)  # type: ignore
     return Release(
-        title=title,
-        region=region,
-        publisher=publisher,
-        product_id=product_id,
-        release_date=release_date,
+        title=title,  # type: ignore
+        region=region,  # type: ignore
+        publisher=publisher,  # type: ignore
+        product_id=product_id,  # type: ignore
+        release_date=release_date,  # type: ignore
     )
 
 
-def _parse_date(value: str) -> Union[date, str]:
-    with suppress(ValueError):
-        return datetime.strptime(value, "%m/%d/%y").date()
-    with suppress(ValueError):
-        return datetime.strptime(value, "%B %Y").date()
-    with suppress(ValueError):
-        return datetime.strptime(value, "%Y").date()
-    if value == "TBA":
-        return value
-    raise ValueError(f"unknown date value '{value}'")
-
-
-def _get_game_guides(url: str) -> list[GuideGame]:
-    text = cached_fetch_text(url)
-    q = PyQuery(text).make_links_absolute(base_url=f"{url}/")
+def _get_game_guides(session: CachedSession, url: str) -> list[GuideGame]:
+    r = _request(session, url=url)
+    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
     items_q = q("div.main_content > div.span8 > div.pod:not(#gamespace_search_module):first > *")
     items_section: dict[Union[str, None], list] = {}
     version_name = None
-    for el in items_q:
-        if el.tag not in ("a", "h2", "div"):
+    for element in items_q:
+        if element.tag not in ("a", "h2", "div"):
             continue
-        if el.tag == "div" and el.attrib["class"] not in ("head", "body"):
+        if element.tag == "div" and element.attrib["class"] not in ("head", "body"):
             continue
-        if el.tag == "a":
-            version_name = el.attrib["name"]
+        if element.tag == "a":
+            version_name = element.attrib["name"]
             continue
-        if el.tag == "div":
-            items_section.setdefault(version_name, []).append(el)
+        if element.tag == "div":
+            items_section.setdefault(version_name, []).append(element)
     guides_games = []
     for version_key, version_sections in items_section.items():
-        sections_items = unflatten(map(PyQuery, version_sections), size=2)
+        sections_items = _unflatten(map(PyQuery, version_sections), size=2)
         sections = []
         for head, body in sections_items:
             guilde_items = map(PyQuery, body("ol li"))
@@ -338,215 +572,488 @@ def _get_game_guides_item(q: PyQuery) -> Guide:
     author_link_url = author_link.attr("href")
     author_link_name = author_link.text()
     flairs = [flair.text.strip() for flair in q("span.flair")]
-    notes = q("div.meta.float_l.bold.ital").text().strip("*")
+    notes = q("div.meta.float_l.bold.ital").text().strip("*")  # type: ignore
     status = q("span.ital").text()
-    author = GuideAuthor(url=author_link_url, name=author_link_name)
+    author = GuideAuthor(url=author_link_url, name=author_link_name)  # type: ignore
     return Guide(
-        platform=platform,
-        url=guide_link_url,
-        name=guide_link_name,
+        platform=platform,  # type: ignore
+        url=guide_link_url,  # type: ignore
+        name=guide_link_name,  # type: ignore
         author=author,
         flairs=flairs,
         notes=notes,
-        status=status,
+        status=status,  # type: ignore
     )
 
 
-def download_guides(game: Game) -> None:
+def download_guides(session: CachedSession, game: Game) -> None:
     urls = sorted(
         guide.url
         for game_version in game.guides
         for section in game_version.sections
         for guide in section.guides
     )
-    for url in tqdm(urls, desc=f"Downloading {game.name} guides", leave=False, ncols=120):
-        _download_guide(url)
+    for url in tqdm(
+        urls,
+        desc=f"Downloading {game.name} guides",
+        leave=False,
+        ncols=120,
+    ):
+        _download_guide_item(session, url=url)
 
 
-def _download_guide(url: str) -> None:
-    data = cached_fetch(url)
-    key = get_cache_key(url)
-    path = guides_path / f"{key}.value"
-    if not (key_filename := guides_path / f"{key}.key").exists():
-        with key_filename.open(mode="xt", encoding="utf-8") as f:
-            f.write(url)
-    if not path.exists():
-        path.mkdir(parents=True)
-    mimetype = mime_database.from_buffer(data[:1000])
+def _download_guide_item(session: CachedSession, url: str) -> None:
+    r = _request(session, url=url)
+    data = r.content
+    mimetype = mime_database.from_buffer(data)
     if mimetype == "application/zip":
-        logger.info("%s is zipfile", url)
-        _save_guide_zip(path, data)
+        logger.info("%s is zipfile with size=%d", url, len(data))
+        _save_guide_zip(url=url, data=data)
         return
-    q = PyQuery(data).make_links_absolute(base_url=f"{url}/")
+    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
     if (html := q("div.ffaq.ffaqbody#faqwrap").html(method="html")) is not None:
         logger.info("%s is html with size=%d", url, len(html))
-        _save_guide_html(path, html)
+        _save_guide_html(session, key=url, html=html)  # type: ignore
         return
     if (img_url := q("div#map_container img#gf_map").attr("src")) is not None:
         logger.info("%s contains image as %s", url, img_url)
-        _save_guide_img(path, img_url)
+        _save_guide_image(session, key=url, url=img_url)  # type: ignore
         return
     if text := "".join(t.text for t in q("div.faqtext#faqtext pre")):
         logger.info("%s is text with size=%d", url, len(text))
-        _save_guide_text(path, text)
+        _save_guide_text(key=url, text=text)
         return
     raise ValueError(f"unknown guide type for {url}")
 
 
-def _save_guide_zip(path: Path, data: bytes) -> None:
-    with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
-        for zinfo in zf.infolist():
-            if (filename := path / zinfo.filename).exists():
+def _save_guide_zip(url: str, data: bytes) -> None:
+    path = _save_data(name="data.zip", key=url, data=data, prefix=storage_path)
+    path = path / "content"
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        for name in zf.namelist():
+            filename = (filename := path / name)
+            if filename.exists():
                 logger.info("%s exists", filename)
-            else:
-                zf.extract(zinfo, path=path)
-                logger.info("%s saved", filename)
+                continue
+            filename.parent.mkdir(parents=True, exist_ok=True)
+            content_data = zf.read(name)
+            filename.write_bytes(content_data)
 
 
-def _save_guide_html(path: Path, html: str) -> None:
+def _save_guide_html(session: CachedSession, key: str, html: str) -> Path:
     q = PyQuery(html)
-    toc = q("div.ftoc").html(method="html")
-    for url in sorted(_get_html_guide_toc_links(html)):
-        html_filename = _download_html_guide_html(path, url=url)
-        toc = toc.replace(url, html_filename)
-    if (filename := path / "guide.html").exists():
-        logger.info("%s exists", filename)
-    else:
-        with filename.open(mode="xt", encoding="utf-8") as f:
-            f.write(toc)
-        logger.info("%s saved", filename)
+    content = q("div.ftoc")
+    urls = {urlparse(tag.attrib["href"])._replace(fragment="").geturl() for tag in content("a")}
+    urls_map = {url: _download_html_guide_html(session, url=url, prefix=storage_path) for url in sorted(urls)}
+    for tag in content("a"):
+        tag_url_parsed = urlparse(tag.attrib["href"])
+        fragment =  tag_url_parsed.fragment
+        old_url = tag_url_parsed._replace(fragment="").geturl()
+        path = urls_map[old_url].relative_to(storage_path)
+        new_url = urlparse(str(path))._replace(fragment=fragment).geturl()
+        tag.attrib["href"] = new_url
+    path = _save_data(
+        name="data.html",
+        key=key,
+        data=as_html_data(content),
+        prefix=storage_path,
+    )
+    return path / "data.html"
 
 
-def _get_html_guide_toc_links(html: str) -> set[str]:
-    html_q = PyQuery(html)
-    toc_urls = set()
-    for t in html_q("div.ftoc a"):
-        toc_url = t.attrib["href"]
-        parsed_url = urlparse(toc_url)
-        parsed_url = parsed_url._replace(fragment="")
-        toc_url = urlunparse(parsed_url)
-        toc_urls.add(toc_url)
-    return toc_urls
+def _download_html_guide_html(session: CachedSession, url: str, prefix: Path) -> Path:
+    r = _request(session, url=url)
+    q = PyQuery(r.text).make_links_absolute(base_url=r.url)
+    content = q("div.ffaq.ffaqbody#faqwrap")
+    content("div.ftoc").remove()
+    urls = {tag.attrib["src"] for tag in content("img")}
+    urls_map = {url: _download_html_guide_image(session, url=url, path=storage_path) for url in sorted(urls)}
+    for tag in content("img"):
+        tag_url_parsed = urlparse(tag.attrib["src"])
+        old_url = tag_url_parsed._replace(fragment="").geturl()
+        path = urls_map[old_url].relative_to(storage_path)
+        new_url = urlparse(str(path)).geturl()
+        tag.attrib["href"] = new_url
+    path = _save_data(
+        name="data.html",
+        key=url,
+        data=as_html_data(content),
+        prefix=prefix,
+    )
+    return path / "data.html"
 
 
-def _download_html_guide_html(path: Path, url: str) -> str:
-    data = cached_fetch(url)
-    key = get_cache_key(url)
-    q = PyQuery(data).make_links_absolute(base_url=f"{url}/")
-    body = q("div.ffaq.ffaqbody#faqwrap")
-    body("div.ftoc").remove()
-    html = body.html(method="html").strip()
-    html_q = PyQuery(html)
-    for img in html_q("img"):
-        img_url = img.attrib["src"]
-        img_filename = _download_html_guide_image(path, url=img_url)
-        html = html.replace(img_url, img_filename)
-    if (filename := path / f"{key}.html").exists():
-        logger.info("%s exists", filename)
-    else:
-        with filename.open(mode="xt", encoding="utf-8") as f:
-            f.write(html)
-        logger.info("%s saved", filename)
-    return filename.name
-
-
-def _download_html_guide_image(path: Path, url: str) -> str:
-    data = cached_fetch(url=url)
-    key = get_cache_key(url)
+def _download_html_guide_image(session: CachedSession, url: str, path: Path) -> Path:
+    r = _request(session, url=url)
+    data = r.content
     mimetype = mime_database.from_buffer(data)
     ext = mimetypes.guess_extension(mimetype, strict=True)
-    if (img_filename := path / f"{key}{ext}").exists():
-        logger.info("%s exists", img_filename)
-    else:
-        with img_filename.open(mode="xb") as f:
-            f.write(data)
-        logger.info("%s saved", img_filename)
-    return img_filename.name
+    if ext is None:
+        ext = ".bin"
+    filename = f"data{ext}"
+    path = _save_data(
+        name=filename,
+        key=url,
+        data=data,
+        prefix=path,
+    )
+    return path / filename
 
 
-def _save_guide_img(path: Path, img_url: str) -> None:
-    img_data = cached_fetch(url=img_url)
-    img_mimetype = mime_database.from_buffer(img_data)
-    img_ext = mimetypes.guess_extension(img_mimetype, strict=True)
-    if (filename := path / f"guide{img_ext}").exists():
-        logger.info("%s exists", filename)
-    else:
-        with filename.open(mode="xb") as f:
-            f.write(img_data)
-        logger.info("%s saved", filename)
+def _save_guide_image(session: CachedSession, key: str, url: str) -> Path:
+    r = _request(session, url=url)
+    data = r.content
+    mimetype = mime_database.from_buffer(data)
+    ext = mimetypes.guess_extension(mimetype, strict=True)
+    if ext is None:
+        ext = ".bin"
+    filename = f"data{ext}"
+    path = _save_data(
+        name=filename,
+        key=key,
+        data=data,
+        prefix=storage_path,
+    )
+    return path / filename
 
 
-def _save_guide_text(path: Path, text: str) -> None:
-    if (filename := path / "guide.txt").exists():
-        logger.info("%s exists", filename)
-    else:
-        with filename.open(mode="xt", encoding="utf-8") as f:
-            f.write(text)
-        logger.info("%s saved", filename)
-
-
-def cached_fetch_text(*args, **kwargs) -> str:
-    return cached_fetch(*args, **kwargs).decode(encoding="utf-8")
-
-
-def cached_fetch(url: str, params: Optional[dict[str, Union[str, int]]] = None) -> bytes:
-    if params is None:
-        params = {}
-    params_str = urlencode(sorted(params.items()))
-    cache_key = f"{url}::{params_str}"
-    try:
-        data = cache_get(cache_key)
-    except CacheMiss:
-        r = _request(url=url, params=params)
-        data = r.content
-        cache_write(cache_key, data, metadata={"headers": {k: v for k, v in r.headers.items()}})
-    return data
-
-
-def cache_get(key: str) -> bytes:
-    logger.info("cache get key=%s", key)
-    cache_key = get_cache_key(key)
-    try:
-        with (cache_path / f"{cache_key}.value").open(mode="rb") as f:
-            value = f.read()
-    except FileNotFoundError as e:
-        logger.warning("cache miss key=%s", key)
-        raise CacheMiss(key) from e
-    logger.debug("cache hit key=%s, size=%d", key, len(value))
-    return value
-
-
-def cache_write(key: str, value: bytes, metadata: dict[str, Any]) -> None:
-    cache_key = get_cache_key(key)
-    with (cache_path / f"{cache_key}.value").open(mode="xb") as f:
-        f.write(value)
-    with (cache_path / f"{cache_key}.key").open(mode="xt", encoding="utf-8") as f:
-        f.write(key)
-    with (cache_path / f"{cache_key}.metadata").open(mode="xt", encoding="utf-8") as f:
-        json.dump(metadata, f)
-    logger.info("cache write key=%s, size=%d", key, len(value))
-
-
-def get_cache_key(key: str) -> str:
-    return hashlib.sha256(key.encode(encoding="utf-8")).hexdigest()
+def _save_guide_text(key: str, text: str) -> None:
+    _save_data(
+        name="data.txt",
+        key=key,
+        data=text.encode(encoding="utf-8"),
+        prefix=storage_path,
+    )
 
 
 @retry(
-    retry=retry_if_exception_type(requests.HTTPError),
+    retry=retry_if_exception_type(HTTPError),
     stop=stop_after_attempt(5),
     wait=wait_fixed(30),
     before=before_log(logger, logging.DEBUG),
     after=after_log(logger, logging.DEBUG),
 )
-def _request(url: str, params: Optional[dict[str, Union[str, int]]] = None) -> requests.Response:
+def _request(session: CachedSession, url: str, params: T_Params = None) -> Response:
     r = session.request(method="GET", url=url, params=params)
     r.raise_for_status()
+    if not isinstance(r, (CachedResponse,)):
+        time_to_sleep = random.randint(100, 300) / 100
+        sleep(time_to_sleep)
     return r
 
 
-def unflatten(seq: Iterable, size: int) -> list:
+# @retry(
+#     retry=retry_if_exception_type(HTTPError),
+#     stop=stop_after_attempt(5),
+#     wait=wait_fixed(30),
+#     before=before_log(logger, logging.DEBUG),
+#     after=after_log(logger, logging.DEBUG),
+# )
+# def _stream_request(session: CachedSession, url: str, params: T_Params = None) -> tuple[Response, bytes]:
+#     r = session.request(method="GET", url=url, params=params, stream=True)
+#     r.raise_for_status()
+#     total_size = int(r.headers.get("content-length", 0))
+#     block_size = 1024
+#     buffer = BytesIO()
+#     with tqdm.wrapattr(
+#         stream=buffer,
+#         method="write",
+#         miniters=1,
+#         desc=f"Downloading {url}",
+#         total=total_size,
+#         unit="B",
+#         unit_scale=True,
+#         leave=False,
+#         ncols=120,
+#     ) as f:
+#         for data in r.iter_content(block_size):
+#             f.write(data)
+#     buffer.seek(0)
+#     if not isinstance(r, (CachedResponse,)):
+#         time_to_sleep = random.randint(100, 300) / 100
+#         sleep(time_to_sleep)
+#     return r, buffer.getvalue()
+
+
+def _save_data(name: str, key: str, data: bytes, prefix: Path) -> Path:
+    key_hash = _key_hash(key)
+    data_prefix = prefix / f"{key_hash}.value"
+    data_prefix.mkdir(parents=True, exist_ok=True)
+    key_filename = prefix / f"{key_hash}.key"
+    key_filename.write_text(key, encoding="utf-8")
+    data_filename = data_prefix / name
+    # if data_filename.exists():
+    #     logger.info("%s exists", data_filename)
+    #     return data_prefix
+    data_filename.write_bytes(data)
+    logger.info("%s saved", name)
+    return data_prefix
+
+
+def as_html_data(q: PyQuery) -> bytes:
+    content = q.html(method="html")
+    if content is None:
+        raise ValueError("empty html")
+    return content.strip().encode(encoding="utf-8")  # type: ignore
+
+
+def _key_hash(value: str) -> str:
+    return hashlib.sha256(value.encode(encoding="utf-8")).hexdigest()
+
+
+def _unflatten(seq: Iterable, size: int) -> list:
     return [*zip(*(iter(seq),) * size)]
 
+
+def _parse_date(value: str) -> Union[date, str]:
+    with suppress(ValueError):
+        return datetime.strptime(value, "%m/%d/%y").date()
+    with suppress(ValueError):
+        return datetime.strptime(value, "%B %Y").date()
+    with suppress(ValueError):
+        return datetime.strptime(value, "%Y").date()
+    if value == "TBA":
+        return value
+    if value == "Canceled":
+        return value
+    raise ValueError(f"unknown date value '{value}'")
+
+
+def _try_date(value: str) -> Union[date, str]:
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return value
+
+
+def _release_date(release: Release):
+    if isinstance(release.release_date, (date,)):
+        return release.release_date
+    return date.max
+
+
+def _get_items_names(items: list[WithName]) -> str:
+    return ", ".join(item.name for item in items)
+
+
+GAMES_LIST_TPL = """{% extends "base.html" %}
+{%- block title %}Games list{%- endblock title %}
+{%- block content %}
+        <h1>Games</h1>
+        <table class="table table-stripped table-bordered table-hover">
+            <thead>
+                <tr>
+                    <td>Name</td>
+                    <td>Release Date</td>
+                </tr>
+            </thead>
+            <tbody>
+                {%- for game in games %}
+                <tr>
+                    <td><a href="{{ url_path_for("game_detail", slug=game.slug) }}">{{ game.name }}</a></td>
+                    <td>{{ game.first_release_date }}</td>
+                </tr>
+                {%- endfor %}
+            </tbody>
+        </table>
+{%- endblock content %}"""
+
+GAME_DETAIL_TPL = """{% extends "base.html" %}
+{%- block title %}{{ game.name }}{%- endblock title %}
+{%- block content %}
+        <h4>Details</h4>
+        <table class="table table-stripped table-bordered">
+            <tbody>
+                <tr>
+                    <td>Name</td>
+                    <td>{{ game.name }}</td>
+                </tr>
+                <tr>
+                    <td>Alternative Names</td>
+                    <td>{{ game.alternative_names | join(", ") }}</td>
+                </tr>
+                <tr>
+                    <td>Platform</td>
+                    <td>{{ get_items_names(game.platform) }}</td>
+                </tr>
+                <tr>
+                    <td>Genre</td>
+                    <td>{{ get_items_names(game.genre) }}</td>
+                </tr>
+                <tr>
+                    <td>Developer</td>
+                    <td>{{ get_items_names(game.developer) }}</td>
+                </tr>
+                <tr>
+                    <td>Publisher</td>
+                    <td>{{ get_items_names(game.publisher) }}</td>
+                </tr>
+                <tr>
+                    <td>Franchises</td>
+                    <td>{{ get_items_names(game.franchises) }}</td>
+                </tr>
+            </tbody>
+        </table>
+        <h4>Releases</h4>
+        <table class="table table-stripped table-bordered">
+            <thead>
+                <tr>
+                    <td>Title</td>
+                    <td>Region</td>
+                    <td>Publisher</td>
+                    <td>Product ID</td>
+                    <td>Release Date</td>
+                </tr>
+            </thead>
+            <tbody>
+                {%- for release in game.releases %}
+                <tr>
+                    <td>{{ release.title }}</td>
+                    <td>{{ release.region }}</td>
+                    <td>{{ release.publisher.name }}</td>
+                    <td>{{ release.product_id }}</td>
+                    <td>{{ release.release_date }}</td>
+                </tr>
+                {%- endfor %}
+            </tbody>
+        </table>
+        <h4>Guides</h4>
+        {%- if game.guides|length > 1 %}
+        <nav>
+            <div class="nav nav-tabs" id="nav-tab" role="tablist">
+                {%- for guide_game in game.guides %}
+                <button
+                    class="nav-link{% if guide_game.name == game_slug %} active{% endif %}"
+                    id="nav-{{ key_hash(guide_game.name or "") }}-tab"
+                    data-bs-toggle="tab"
+                    data-bs-target="#nav-{{ key_hash(guide_game.name or "") }}"
+                    type="button"
+                    role="tab"
+                    aria-controls="nav-{{ key_hash(guide_game.name or "") }}"
+                    aria-selected="true"
+                >
+                    {{ guide_game.name }}
+                </button>
+                {%- endfor %}
+            </div>
+        </nav>
+        <div class="tab-content" id="nav-tabContent">
+            {%- for guide_game in game.guides %}
+            <div
+                class="tab-pane show{% if guide_game.name == game_slug %} active{% endif %}"
+                id="nav-{{ key_hash(guide_game.name or "") }}"
+                role="tabpanel"
+                aria-labelledby="nav-{{ key_hash(guide_game.name or "") }}-tab"
+            >
+                <table class="table table-stripped table-bordered table-hover">
+                    <tbody>
+                    {%- for guide_section in guide_game.sections %}
+                        <tr>
+                            <td colspan="3"><strong>{{ guide_section.name }}</strong></td>
+                        </tr>
+                        {%- for guide in guide_section.guides %}
+                        <tr>
+                            <td><a href="{{ url_path_for("game_guide", slug=game.slug, key=key_hash(guide.url)) }}">{{ guide.name }}</a></td>
+                            <td>{{ guide.platform }}</td>
+                            <td>{{ guide.author.name }}</td>
+                        </tr>
+                        {%- endfor %}
+                    {%- endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {%- endfor %}
+        </div>
+        {%- else %}
+        {%- for guide_game in game.guides %}
+        <div
+            class="tab-pane show{% if guide_game.name == game_slug %} active{% endif %}"
+            id="nav-{{ key_hash(guide_game.name or "") }}"
+            role="tabpanel"
+            aria-labelledby="nav-{{ key_hash(guide_game.name or "") }}-tab"
+        >
+            <table class="table table-stripped table-bordered table-hover">
+                <tbody>
+                {%- for guide_section in guide_game.sections %}
+                    <tr>
+                        <td colspan="3"><strong>{{ guide_section.name }}</strong></td>
+                    </tr>
+                    {%- for guide in guide_section.guides %}
+                    <tr>
+                        <td><a href="{{ url_path_for("game_guide", slug=game.slug, key=key_hash(guide.url)) }}">{{ guide.name }}</a></td>
+                        <td>{{ guide.platform }}</td>
+                        <td>{{ guide.author.name }}</td>
+                    </tr>
+                    {%- endfor %}
+                {%- endfor %}
+                </tbody>
+            </table>
+        </div>
+        {%- endfor %}
+        {%- endif %}
+{%- endblock content %}"""
+
+GAME_GUIDE_HTML_TOC_TPL = """{% extends "base.html" %}
+{%- block title %}Guide{%- endblock title %}
+{%- block content %}
+        {{ toc }}
+{%- endblock content %}"""
+
+GAME_GUIDE_HTML_CONTENT_TPL = """{% extends "base.html" %}
+{%- block title %}Guide{%- endblock title %}
+{%- block content %}
+        {{ toc }}
+        {{ html }}
+{%- endblock content %}"""
+
+GAME_GUIDE_IMG_TPL = """{% extends "base.html" %}
+{%- block title %}Guide{%- endblock title %}
+{%- block content %}
+        <img src="{{ url }}" alt="{{ guide.name }}">
+{%- endblock content %}"""
+
+GAME_GUIDE_TXT_TPL = """{% extends "base.html" %}
+{%- block title %}{{ guide.name }}{%- endblock title %}
+{%- block content %}
+        <pre>{{ text }}</pre>
+{%- endblock content %}"""
+
+# https://getbootstrap.com/docs/5.3/examples/cheatsheet/
+BASE_TPL = """<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>{% block title required %}{% endblock title %}</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
+        <style type="text/css">
+            .ffaq tr, td, th {
+                border: 1px solid #ccc;
+            }
+        </style>
+    </head>
+    <body>
+        {%- block content required %}
+        {%- endblock content %}
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
+    </body>
+</html>"""
+
+template_loader = DictLoader(
+    {
+        "games_list.html": GAMES_LIST_TPL,
+        "game_detail.html": GAME_DETAIL_TPL,
+        "game_guide_html_toc.html": GAME_GUIDE_HTML_TOC_TPL,
+        "game_guide_html_content.html": GAME_GUIDE_HTML_CONTENT_TPL,
+        "game_guide_img.html": GAME_GUIDE_IMG_TPL,
+        "game_guide_txt.html": GAME_GUIDE_TXT_TPL,
+        "base.html": BASE_TPL,
+    }
+)
+template_environment = Environment(loader=template_loader)
+template_environment.globals["url_path_for"] = app.url_path_for
+template_environment.globals["key_hash"] = _key_hash
+template_environment.globals["get_items_names"] = _get_items_names
 
 if __name__ == "__main__":
     cli()
