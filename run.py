@@ -820,7 +820,7 @@ def game_guide(slug: str, key: str) -> str:
                 guide_type, item = CONTENT_INDEX_HASH[key]
                 match guide_type:
                     case GuideType.ZIP:
-                        return "ZIP"
+                        return "ZIP"  # XXX: TODO
                     case GuideType.HTML:
                         tpl = template_environment.get_template("game_guide_html_toc.html")
                         text = item.read_text(encoding="utf-8")
@@ -831,6 +831,10 @@ def game_guide(slug: str, key: str) -> str:
                             item_key = Path(tag.attrib["href"]).parent.stem
                             url = app.url_path_for("game_guide", slug=slug, key=item_key)
                             tag.attrib["href"] = url
+                        for tag in q("img"):
+                            path = tag.attrib["src"]
+                            url = app.url_path_for("data_storage", path=path)
+                            tag.attrib["src"] = url
                         html = q.html(method="html")
                         return tpl.render(guide=guide, toc=html)
                     case GuideType.IMG:
