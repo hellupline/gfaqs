@@ -27,7 +27,7 @@ from typing import Optional
 from typing import Protocol
 from typing import Self
 from typing import Union
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import click
 import magic
@@ -41,8 +41,9 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import DictLoader
 from jinja2 import Environment
 from pyquery import PyQuery
-from requests import HTTPError
 from requests import Response
+from requests.exceptions import HTTPError
+from requests.exceptions import MissingSchema
 from requests.status_codes import codes
 from requests_cache import NEVER_EXPIRE
 from requests_cache import CachedResponse
@@ -352,6 +353,15 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
         #     session,
         #     url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236/how-to-recruit-pokemon",
         # )
+
+        # _download_guide_item(
+        #     session,
+        #     url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236",
+        # )
+        # _download_guide_item(
+        #     session,
+        #     url="https://gamefaqs.gamespot.com/snes/588741-super-metroid/faqs/29226",
+        # )
         # _download_guide_item(
         #     session,
         #     url="https://gamefaqs.gamespot.com/ds/661226-pokemon-black-version-2/faqs/64482",
@@ -360,10 +370,7 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
         #     session,
         #     url="https://gamefaqs.gamespot.com/ds/920760-metroid-prime-hunters/faqs/78897",
         # )
-        # _download_guide_item(
-        #     session,
-        #     url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236",
-        # )
+
         for game_system in map(GameSystem, system_names):
             url = f"https://gamefaqs.gamespot.com/{game_system.value}/category/999-all"
             for url in tqdm(
@@ -382,20 +389,20 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
 
 def get_games_urls(session: CachedSession, url: str) -> set[str]:
     r = _request(session, url=url, params={"page": 0})
-    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+    q = _html_parse_from_request(r)
     search = "table.results tbody tr td.rtitle a:not(.cancel)"
     urls = {t.attrib["href"] for t in q(search)}
     last_page = max(int(t.attrib.get("value", -1)) for t in q("select#pagejump option"))
     for page in range(1, last_page + 1):
         r = _request(session, url=url, params={"page": page})
-        q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+        q = _html_parse_from_request(r)
         urls.update({t.attrib["href"] for t in q(search)})
     return urls
 
 
 def get_game(session: CachedSession, url: str) -> Game:
     r = _request(session, url=url)
-    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+    q = _html_parse_from_request(r)
     slug: str = Path(urlparse(url).path).name
     name: str = q("div.header_right h1.page-title").text()  # type: ignore
     description: str = q("div.content div.game_desc").text()  # type: ignore
@@ -437,7 +444,7 @@ def _get_game_fields(q: PyQuery, game: Game) -> None:
 
 def _get_game_releases(session: CachedSession, url: str) -> list[Release]:
     r = _request(session, url=url)
-    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+    q = _html_parse_from_request(r)
     items_q = q("div.gdata div.body table tbody tr")
     _, *items = _unflatten(map(PyQuery, items_q), size=2)
     releases = []
@@ -470,7 +477,7 @@ def _get_game_release_detail(first_row: PyQuery, second_row: PyQuery) -> Release
 
 def _get_game_guides(session: CachedSession, url: str) -> list[GuideGame]:
     r = _request(session, url=url)
-    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+    q = _html_parse_from_request(r)
     items_q = q("div.main_content > div.span8 > div.pod:not(#gamespace_search_module):first > *")
     items_section: dict[Union[str, None], list] = {}
     version_name = None
@@ -545,7 +552,7 @@ def _download_guide_item(session: CachedSession, url: str) -> None:
         logger.info("%s is zipfile with size=%d", url, len(data))
         _save_guide_zip(url=url, data=data)
         return
-    q = PyQuery(r.text).make_links_absolute(base_url=f"{r.url}/")
+    q = _html_parse_from_request(r)
     if (html := q("div.ffaq.ffaqbody#faqwrap").html(method="html")) is not None:
         logger.info("%s is html with size=%d", url, len(html))
         _save_guide_html(session, key=url, html=html)  # type: ignore
@@ -610,7 +617,7 @@ def _download_html_guide_html(
     if url in visited:
         return
     r = _request(session, url=url)
-    q = PyQuery(r.text).make_links_absolute(base_url=r.url)
+    q = _html_parse_from_request(r)
     content = q("div.ffaq.ffaqbody#faqwrap")
     content("div.ftoc").remove()
     url_path_map = {
@@ -673,6 +680,8 @@ class retry_if_http_error(retry_base):
                 case None:
                     return False
                 case HTTPError(response=Response(status_code=codes.not_found)):
+                    return False
+                case MissingSchema():
                     return False
         return True
 
@@ -750,6 +759,18 @@ def _as_html_data(q: PyQuery) -> bytes:
     if content is None:
         raise ValueError("empty html")
     return content.strip().encode(encoding="utf-8")  # type: ignore
+
+
+def _html_parse_from_request(response: Response) -> PyQuery:
+    q = PyQuery(response.text)
+    base_url = _html_base_url(response.url, q)
+    return q.make_links_absolute(base_url=base_url)
+
+
+def _html_base_url(url: str, q: PyQuery) -> str:
+    if (base := q.find("base").attr("href")) is not None:
+        return urljoin(url, base)  # type: ignore
+    return url
 
 
 def _html_url_key(url: str) -> str:
