@@ -86,7 +86,7 @@ logging.basicConfig(
     # filename=log_filename,
 )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 mime_database = magic.Magic(mime=True)
 
