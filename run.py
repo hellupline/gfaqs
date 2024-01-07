@@ -27,7 +27,8 @@ from typing import Optional
 from typing import Protocol
 from typing import Self
 from typing import Union
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
+from urllib.parse import urlparse
 
 import click
 import magic
