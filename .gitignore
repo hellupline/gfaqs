@@ -1,3 +1,6 @@
+__pycache__/*
 data/games/*.json
 data/storage/*.key
 data/storage/*.value
+logs/*
+requests_cache.sqlite

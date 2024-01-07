@@ -74,16 +74,16 @@ storage_path = Path("data/storage")
 storage_path.mkdir(parents=True, exist_ok=True)
 games_path = Path("data/games")
 games_path.mkdir(parents=True, exist_ok=True)
-# logs_path = Path("logs")
-# logs_path.mkdir(parents=True, exist_ok=True)
+logs_path = Path("logs")
+logs_path.mkdir(parents=True, exist_ok=True)
 
 log_format = "[%(asctime)s:%(levelname)s] %(message)s"
 log_datefmt = "%Y-%m-%dT%H:%M:%S%z"
-# log_filename = logs_path / "{:%Y-%m-%dT%H:%M:%S}.log".format(datetime.now())
+log_filename = logs_path / "{:%Y-%m-%dT%H:%M:%S}.log".format(datetime.now())
 logging.basicConfig(
     format=log_format,
     datefmt=log_datefmt,
-    # filename=log_filename,
+    filename=log_filename,
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -620,10 +620,14 @@ def _download_html_guide_html(
     url_map = {url: str(path.relative_to(storage_path)) for url, path in url_path_map.items()}
     for tag in content("img"):
         tag.attrib["src"] = _get_new_url(tag.attrib["src"], url_map=url_map)
+    if content.html(method="html") is None:
+        raise Exception(url)
     yield url, _as_html_data(content)
     visited.add(url)
     to_visit_urls = sorted({_clean_url(tag.attrib["href"]) for tag in content("a") if "href" in tag.attrib})
     for to_visit_url in to_visit_urls:
+        if to_visit_url in INVALID_URLS:
+            continue
         try:
             yield from _download_html_guide_html(session=session, url=to_visit_url, visited=visited)
         except (HTTPError,) as e:
@@ -1110,6 +1114,9 @@ template_environment.globals["get_items_names"] = _get_items_names
 CONTENT_INDEX_HASH: dict[str, tuple[GuideType, Path]] = {}
 GAMES_LIST: list[Game] = []
 GAMES_INDEX_SLUG: dict[str, Game] = {}
+INVALID_URLS = {
+    "https://www.gamefaqs.com/contribute/test_file_v3/51/minigames",
+}
 
 
 if __name__ == "__main__":
