@@ -57,7 +57,7 @@ from tenacity import wait_fixed
 from tqdm import tqdm
 
 
-T_Params = Optional[dict[str, Union[str, int]]]
+Params_T = Optional[dict[str, Union[str, int]]]
 
 DEFAULT_HEADERS = {
     "user-agent": (
@@ -360,24 +360,24 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
         #     session,
         #     url="https://gamefaqs.gamespot.com/ds/920760-metroid-prime-hunters/faqs/78897",
         # )
-        _download_guide_item(
-            session,
-            url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236",
-        )
-        # for game_system in map(GameSystem, system_names):
-        #     url = f"https://gamefaqs.gamespot.com/{game_system.value}/category/999-all"
-        #     for url in tqdm(
-        #         sorted(get_games_urls(session, url)),
-        #         desc=f"Downloading {game_system.value} guides",
-        #         leave=True,
-        #         ncols=120,
-        #     ):
-        #         if game_names and not any(name in url for name in game_names):
-        #             continue
-        #         game = get_game(session, url)
-        #         download_guides(session, game)
-        #         with (games_path / f"{game.slug}.json").open(mode="wt", encoding="utf-8") as f:
-        #             json.dump(asdict(game), f, cls=DateTimeEncoder)
+        # _download_guide_item(
+        #     session,
+        #     url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236",
+        # )
+        for game_system in map(GameSystem, system_names):
+            url = f"https://gamefaqs.gamespot.com/{game_system.value}/category/999-all"
+            for url in tqdm(
+                sorted(get_games_urls(session, url)),
+                desc=f"Downloading {game_system.value} guides",
+                leave=True,
+                ncols=120,
+            ):
+                if game_names and not any(name in url for name in game_names):
+                    continue
+                game = get_game(session, url)
+                download_guides(session, game)
+                with (games_path / f"{game.slug}.json").open(mode="wt", encoding="utf-8") as f:
+                    json.dump(asdict(game), f, cls=DateTimeEncoder)
 
 
 def get_games_urls(session: CachedSession, url: str) -> set[str]:
@@ -666,6 +666,8 @@ class retry_if_http_error(retry_base):
     def __call__(self, retry_state: RetryCallState) -> bool:
         if retry_state.outcome is not None:
             match retry_state.outcome.exception():
+                case None:
+                    return False
                 case HTTPError(response=Response(status_code=codes.not_found)):
                     return False
         return True
@@ -678,25 +680,27 @@ class retry_if_http_error(retry_base):
     before=before_log(logger, logging.DEBUG),
     after=after_log(logger, logging.DEBUG),
 )
-def _request(session: CachedSession, url: str, params: T_Params = None) -> Response:
-    logger.info("requesting url %s params %s", url, repr(params))
+def _request(session: CachedSession, url: str, params: Params_T = None) -> Response:
+    logger.info("url request %s params %s", url, repr(params))
     r = session.request(method="GET", url=url, params=params)
     r.raise_for_status()
     if not isinstance(r, (CachedResponse,)):
-        logger.info("url was not cached %s", url)
+        logger.info("url not cached %s", url)
         time_to_sleep = random.randint(100, 300) / 100
         sleep(time_to_sleep)
+    else:
+        logger.info("url cached %s", url)
     return r
 
 
 # @retry(
-#     retry=retry_if_exception_type(HTTPError),
+#     retry=retry_if_http_error(),
 #     stop=stop_after_attempt(5),
 #     wait=wait_fixed(30),
 #     before=before_log(logger, logging.DEBUG),
 #     after=after_log(logger, logging.DEBUG),
 # )
-# def _stream_request(session: CachedSession, url: str, params: T_Params = None) -> tuple[Response, bytes]:
+# def _stream_request(session: CachedSession, url: str, params: Params_T = None) -> tuple[Response, bytes]:
 #     r = session.request(method="GET", url=url, params=params, stream=True)
 #     r.raise_for_status()
 #     total_size = int(r.headers.get("content-length", 0))
