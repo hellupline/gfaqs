@@ -43,13 +43,15 @@ from jinja2 import Environment
 from pyquery import PyQuery
 from requests import HTTPError
 from requests import Response
+from requests.status_codes import codes
 from requests_cache import NEVER_EXPIRE
 from requests_cache import CachedResponse
 from requests_cache import CachedSession
+from tenacity import RetryCallState
 from tenacity import after_log
 from tenacity import before_log
 from tenacity import retry
-from tenacity import retry_if_exception_type
+from tenacity import retry_base
 from tenacity import stop_after_attempt
 from tenacity import wait_fixed
 from tqdm import tqdm
@@ -72,15 +74,19 @@ storage_path = Path("data/storage")
 storage_path.mkdir(parents=True, exist_ok=True)
 games_path = Path("data/games")
 games_path.mkdir(parents=True, exist_ok=True)
-logs_path = Path("logs")
-logs_path.mkdir(parents=True, exist_ok=True)
+# logs_path = Path("logs")
+# logs_path.mkdir(parents=True, exist_ok=True)
 
 log_format = "[%(asctime)s:%(levelname)s] %(message)s"
 log_datefmt = "%Y-%m-%dT%H:%M:%S%z"
-log_filename = logs_path / "{:%Y-%m-%dT%H:%M:%S}.log".format(datetime.now())
-logging.basicConfig(format=log_format, datefmt=log_datefmt, filename=log_filename)
+# log_filename = logs_path / "{:%Y-%m-%dT%H:%M:%S}.log".format(datetime.now())
+logging.basicConfig(
+    format=log_format,
+    datefmt=log_datefmt,
+    # filename=log_filename,
+)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 mime_database = magic.Magic(mime=True)
 
@@ -338,13 +344,25 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
     with CachedSession(
         "requests_cache",
         expire_after=NEVER_EXPIRE,
-        allowable_codes=[200, 404],
+        allowable_codes=[codes.ok, codes.not_found],
         allowable_methods=["GET"],
     ) as session:
         session.headers.update(DEFAULT_HEADERS)
+        # _request(
+        #     session,
+        #     url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236/how-to-recruit-pokemon",
+        # )
+        # _download_guide_item(
+        #     session,
+        #     url="https://gamefaqs.gamespot.com/ds/661226-pokemon-black-version-2/faqs/64482",
+        # )
+        # _download_guide_item(
+        #     session,
+        #     url="https://gamefaqs.gamespot.com/ds/920760-metroid-prime-hunters/faqs/78897",
+        # )
         _download_guide_item(
             session,
-            url="https://gamefaqs.gamespot.com/ds/920760-metroid-prime-hunters/faqs/78897",
+            url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236",
         )
         # for game_system in map(GameSystem, system_names):
         #     url = f"https://gamefaqs.gamespot.com/{game_system.value}/category/999-all"
@@ -360,89 +378,6 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
         #         download_guides(session, game)
         #         with (games_path / f"{game.slug}.json").open(mode="wt", encoding="utf-8") as f:
         #             json.dump(asdict(game), f, cls=DateTimeEncoder)
-
-
-@app.get("/", response_class=RedirectResponse)
-def root():
-    return app.url_path_for("games_list")
-
-
-@app.get("/games", response_class=HTMLResponse)
-def games_list() -> str:
-    tpl = template_environment.get_template("games_list.html")
-    return tpl.render(games=GAMES_LIST)
-
-
-@app.get("/games/{slug:str}", response_class=HTMLResponse)
-def game_detail(slug: str) -> str:
-    game = GAMES_INDEX_SLUG[slug]
-    _, game_slug = game.slug.split("-", maxsplit=1)
-    tpl = template_environment.get_template("game_detail.html")
-    return tpl.render(game=game, game_slug=game_slug)
-
-
-@app.get("/games/{slug:str}/guide/{key:str}", response_class=HTMLResponse)
-def game_guide(slug: str, key: str) -> str:
-    game = GAMES_INDEX_SLUG[slug]
-    for guide_game in game.guides:
-        for guide_section in guide_game.sections:
-            for guide in guide_section.guides:
-                guide_type, item = CONTENT_INDEX_HASH[key]
-                match guide_type:
-                    case GuideType.ZIP:
-                        return "ZIP"
-                    case GuideType.HTML:
-                        tpl = template_environment.get_template("game_guide_html_toc.html")
-                        text = item.read_text(encoding="utf-8")
-                        q = PyQuery(text)
-                        for tag in q("a"):
-                            if "href" not in tag.attrib:
-                                continue
-                            item_key = Path(tag.attrib["href"]).parent.stem
-                            url = app.url_path_for("game_guide", slug=slug, key=item_key)
-                            tag.attrib["href"] = url
-                        html = q.html(method="html")
-                        return tpl.render(guide=guide, toc=html)
-                    case GuideType.IMG:
-                        tpl = template_environment.get_template("game_guide_img.html")
-                        path = item.relative_to(storage_path)
-                        url = app.url_path_for("data_storage", path=str(path))
-                        return tpl.render(guide=guide, url=url)
-                    case GuideType.TXT:
-                        tpl = template_environment.get_template("game_guide_txt.html")
-                        text = item.read_text(encoding="utf-8")
-                        return tpl.render(guide=guide, text=text)
-                    case _:
-                        raise ValueError(f"Unknown guide type for {key}")
-    raise HTTPException(status_code=404, detail="Guide not found")
-
-
-def load_content_list() -> Generator[tuple[str, GuideType, Path], None, None]:
-    for path in storage_path.glob("*.key"):
-        key = path.stem
-        guide_path = storage_path / f"{key}.value"
-        if (filename := (guide_path / "data.html")).exists():
-            yield (key, GuideType.HTML, filename)
-        elif (filename := (guide_path / "data.png")).exists():
-            yield (key, GuideType.IMG, filename)
-        elif (filename := (guide_path / "data.jpg")).exists():
-            yield (key, GuideType.IMG, filename)
-        elif (filename := (guide_path / "data.gif")).exists():
-            yield (key, GuideType.IMG, filename)
-        elif (filename := (guide_path / "data.txt")).exists():
-            yield (key, GuideType.TXT, filename)
-        elif (filename := (guide_path / "data.zip")).exists():
-            yield (key, GuideType.ZIP, filename)
-        # else:
-        #     raise ValueError(f"Unknown guide type for {key}")
-
-
-def load_games_list() -> list[Game]:
-    return sorted(
-        (Game.from_file(path) for path in games_path.rglob("*.json")),
-        key=attrgetter("first_release_date", "name"),
-        reverse=True,
-    )
 
 
 def get_games_urls(session: CachedSession, url: str) -> set[str]:
@@ -627,7 +562,7 @@ def _download_guide_item(session: CachedSession, url: str) -> None:
 
 
 def _save_guide_zip(url: str, data: bytes) -> None:
-    path = _save_data(name="data.zip", key=url, data=data, prefix=storage_path)
+    path = _save_data(name="data.zip", key=url, data=data)
     path = path / "content"
     with zipfile.ZipFile(BytesIO(data)) as zf:
         for name in zf.namelist():
@@ -643,47 +578,62 @@ def _save_guide_zip(url: str, data: bytes) -> None:
 def _save_guide_html(session: CachedSession, key: str, html: str) -> Path:
     q = PyQuery(html)
     content = q("div.ftoc")
-    urls = {urlparse(tag.attrib["href"])._replace(fragment="").geturl() for tag in content("a")}
-    urls_map = {url: _download_html_guide_html(session, url=url, prefix=storage_path) for url in sorted(urls)}
+    visited: set[str] = set()
+    url_data_map = {
+        visited_url: data
+        for url in sorted({_clean_url(tag.attrib["href"]) for tag in content("a")})
+        for visited_url, data in _download_html_guide_html(session, url=url, visited=visited)
+    }
+    url_map = {url: _html_url_key(url) for url in url_data_map.keys()}
+    for url, data in url_data_map.items():
+        data_q = PyQuery(data)
+        for tag in data_q("a"):
+            if "href" not in tag.attrib:
+                continue
+            with suppress(KeyError):
+                tag.attrib["href"] = _get_new_url(tag.attrib["href"], url_map=url_map)
+        _save_data(name="data.html", key=url, data=_as_html_data(data_q))
     for tag in content("a"):
-        tag_url_parsed = urlparse(tag.attrib["href"])
-        fragment =  tag_url_parsed.fragment
-        old_url = tag_url_parsed._replace(fragment="").geturl()
-        path = urls_map[old_url].relative_to(storage_path)
-        new_url = urlparse(str(path))._replace(fragment=fragment).geturl()
-        tag.attrib["href"] = new_url
-    path = _save_data(
-        name="data.html",
-        key=key,
-        data=as_html_data(content),
-        prefix=storage_path,
-    )
+        if "href" not in tag.attrib:
+            continue
+        with suppress(KeyError):
+            tag.attrib["href"] = _get_new_url(tag.attrib["href"], url_map=url_map)
+    path = _save_data(name="data.html", key=key, data=_as_html_data(content))
     return path / "data.html"
 
 
-def _download_html_guide_html(session: CachedSession, url: str, prefix: Path) -> Path:
+def _download_html_guide_html(
+    session: CachedSession,
+    url: str,
+    visited: set[str],
+) -> Generator[tuple[str, bytes], None, None]:
+    if url in visited:
+        return
     r = _request(session, url=url)
     q = PyQuery(r.text).make_links_absolute(base_url=r.url)
     content = q("div.ffaq.ffaqbody#faqwrap")
     content("div.ftoc").remove()
-    urls = {tag.attrib["src"] for tag in content("img")}
-    urls_map = {url: _download_html_guide_image(session, url=url, path=storage_path) for url in sorted(urls)}
+    url_path_map = {
+        url: _download_html_guide_image(session, url=url)
+        for url in sorted(_clean_url(tag.attrib["src"]) for tag in content("img"))
+    }
+    url_map = {url: str(path.relative_to(storage_path)) for url, path in url_path_map.items()}
     for tag in content("img"):
-        tag_url_parsed = urlparse(tag.attrib["src"])
-        old_url = tag_url_parsed._replace(fragment="").geturl()
-        path = urls_map[old_url].relative_to(storage_path)
-        new_url = urlparse(str(path)).geturl()
-        tag.attrib["href"] = new_url
-    path = _save_data(
-        name="data.html",
-        key=url,
-        data=as_html_data(content),
-        prefix=prefix,
-    )
-    return path / "data.html"
+        tag.attrib["src"] = _get_new_url(tag.attrib["src"], url_map=url_map)
+    yield url, _as_html_data(content)
+    visited.add(url)
+    to_visit_urls = sorted({_clean_url(tag.attrib["href"]) for tag in content("a") if "href" in tag.attrib})
+    for to_visit_url in to_visit_urls:
+        try:
+            yield from _download_html_guide_html(session=session, url=to_visit_url, visited=visited)
+        except (HTTPError,) as e:
+            match e.response:
+                case Response(status_code=codes.not_found):
+                    continue
+            raise
 
 
-def _download_html_guide_image(session: CachedSession, url: str, path: Path) -> Path:
+def _download_html_guide_image(session: CachedSession, url: str) -> Path:
     r = _request(session, url=url)
     data = r.content
     mimetype = mime_database.from_buffer(data)
@@ -691,12 +641,7 @@ def _download_html_guide_image(session: CachedSession, url: str, path: Path) -> 
     if ext is None:
         ext = ".bin"
     filename = f"data{ext}"
-    path = _save_data(
-        name=filename,
-        key=url,
-        data=data,
-        prefix=path,
-    )
+    path = _save_data(name=filename, key=url, data=data)
     return path / filename
 
 
@@ -708,35 +653,37 @@ def _save_guide_image(session: CachedSession, key: str, url: str) -> Path:
     if ext is None:
         ext = ".bin"
     filename = f"data{ext}"
-    path = _save_data(
-        name=filename,
-        key=key,
-        data=data,
-        prefix=storage_path,
-    )
+    path = _save_data(name=filename, key=key, data=data)
     return path / filename
 
 
 def _save_guide_text(key: str, text: str) -> None:
-    _save_data(
-        name="data.txt",
-        key=key,
-        data=text.encode(encoding="utf-8"),
-        prefix=storage_path,
-    )
+    data = text.encode(encoding="utf-8")
+    _save_data(name="data.txt", key=key, data=data)
+
+
+class retry_if_http_error(retry_base):
+    def __call__(self, retry_state: RetryCallState) -> bool:
+        if retry_state.outcome is not None:
+            match retry_state.outcome.exception():
+                case HTTPError(response=Response(status_code=codes.not_found)):
+                    return False
+        return True
 
 
 @retry(
-    retry=retry_if_exception_type(HTTPError),
+    retry=retry_if_http_error(),
     stop=stop_after_attempt(5),
     wait=wait_fixed(30),
     before=before_log(logger, logging.DEBUG),
     after=after_log(logger, logging.DEBUG),
 )
 def _request(session: CachedSession, url: str, params: T_Params = None) -> Response:
+    logger.info("requesting url %s params %s", url, repr(params))
     r = session.request(method="GET", url=url, params=params)
     r.raise_for_status()
     if not isinstance(r, (CachedResponse,)):
+        logger.info("url was not cached %s", url)
         time_to_sleep = random.randint(100, 300) / 100
         sleep(time_to_sleep)
     return r
@@ -775,26 +722,44 @@ def _request(session: CachedSession, url: str, params: T_Params = None) -> Respo
 #     return r, buffer.getvalue()
 
 
-def _save_data(name: str, key: str, data: bytes, prefix: Path) -> Path:
+def _save_data(name: str, key: str, data: bytes) -> Path:
     key_hash = _key_hash(key)
-    data_prefix = prefix / f"{key_hash}.value"
+    data_prefix = storage_path / f"{key_hash}.value"
     data_prefix.mkdir(parents=True, exist_ok=True)
-    key_filename = prefix / f"{key_hash}.key"
+    key_filename = storage_path / f"{key_hash}.key"
     key_filename.write_text(key, encoding="utf-8")
     data_filename = data_prefix / name
     # if data_filename.exists():
     #     logger.info("%s exists", data_filename)
     #     return data_prefix
     data_filename.write_bytes(data)
-    logger.info("%s saved", name)
+    logger.info("key %s saved as %s ", key, name)
     return data_prefix
 
 
-def as_html_data(q: PyQuery) -> bytes:
+def _as_html_data(q: PyQuery) -> bytes:
     content = q.html(method="html")
     if content is None:
         raise ValueError("empty html")
     return content.strip().encode(encoding="utf-8")  # type: ignore
+
+
+def _html_url_key(url: str) -> str:
+    key = _key_hash(url)
+    path = storage_path / f"{key}.value" / "data.html"
+    return str(path.relative_to(storage_path))
+
+
+def _clean_url(value: str) -> str:
+    return urlparse(value)._replace(fragment="").geturl()
+
+
+def _get_new_url(url: str, url_map: dict[str, str]) -> str:
+    parsed = urlparse(url)
+    normalized = parsed._replace(fragment="").geturl()
+    fragment = parsed.fragment
+    new_url = url_map[normalized]
+    return urlparse(new_url)._replace(fragment=fragment).geturl()
 
 
 def _key_hash(value: str) -> str:
@@ -817,6 +782,89 @@ def _parse_date(value: str) -> Union[date, str]:
     if value == "Canceled":
         return value
     raise ValueError(f"unknown date value '{value}'")
+
+
+@app.get("/", response_class=RedirectResponse)
+def root():
+    return app.url_path_for("games_list")
+
+
+@app.get("/games", response_class=HTMLResponse)
+def games_list() -> str:
+    tpl = template_environment.get_template("games_list.html")
+    return tpl.render(games=GAMES_LIST)
+
+
+@app.get("/games/{slug:str}", response_class=HTMLResponse)
+def game_detail(slug: str) -> str:
+    game = GAMES_INDEX_SLUG[slug]
+    _, game_slug = game.slug.split("-", maxsplit=1)
+    tpl = template_environment.get_template("game_detail.html")
+    return tpl.render(game=game, game_slug=game_slug)
+
+
+@app.get("/games/{slug:str}/guide/{key:str}", response_class=HTMLResponse)
+def game_guide(slug: str, key: str) -> str:
+    game = GAMES_INDEX_SLUG[slug]
+    for guide_game in game.guides:
+        for guide_section in guide_game.sections:
+            for guide in guide_section.guides:
+                guide_type, item = CONTENT_INDEX_HASH[key]
+                match guide_type:
+                    case GuideType.ZIP:
+                        return "ZIP"
+                    case GuideType.HTML:
+                        tpl = template_environment.get_template("game_guide_html_toc.html")
+                        text = item.read_text(encoding="utf-8")
+                        q = PyQuery(text)
+                        for tag in q("a"):
+                            if "href" not in tag.attrib:
+                                continue
+                            item_key = Path(tag.attrib["href"]).parent.stem
+                            url = app.url_path_for("game_guide", slug=slug, key=item_key)
+                            tag.attrib["href"] = url
+                        html = q.html(method="html")
+                        return tpl.render(guide=guide, toc=html)
+                    case GuideType.IMG:
+                        tpl = template_environment.get_template("game_guide_img.html")
+                        path = item.relative_to(storage_path)
+                        url = app.url_path_for("data_storage", path=str(path))
+                        return tpl.render(guide=guide, url=url)
+                    case GuideType.TXT:
+                        tpl = template_environment.get_template("game_guide_txt.html")
+                        text = item.read_text(encoding="utf-8")
+                        return tpl.render(guide=guide, text=text)
+                    case _:
+                        raise ValueError(f"Unknown guide type for {key}")
+    raise HTTPException(status_code=404, detail="Guide not found")
+
+
+def load_content_list() -> Generator[tuple[str, GuideType, Path], None, None]:
+    for path in storage_path.glob("*.key"):
+        key = path.stem
+        guide_path = storage_path / f"{key}.value"
+        if (filename := (guide_path / "data.html")).exists():
+            yield (key, GuideType.HTML, filename)
+        elif (filename := (guide_path / "data.png")).exists():
+            yield (key, GuideType.IMG, filename)
+        elif (filename := (guide_path / "data.jpg")).exists():
+            yield (key, GuideType.IMG, filename)
+        elif (filename := (guide_path / "data.gif")).exists():
+            yield (key, GuideType.IMG, filename)
+        elif (filename := (guide_path / "data.txt")).exists():
+            yield (key, GuideType.TXT, filename)
+        elif (filename := (guide_path / "data.zip")).exists():
+            yield (key, GuideType.ZIP, filename)
+        # else:
+        #     raise ValueError(f"Unknown guide type for {key}")
+
+
+def load_games_list() -> list[Game]:
+    return sorted(
+        (Game.from_file(path) for path in games_path.rglob("*.json")),
+        key=attrgetter("first_release_date", "name"),
+        reverse=True,
+    )
 
 
 def _try_date(value: str) -> Union[date, str]:
@@ -1054,6 +1102,11 @@ template_environment = Environment(loader=template_loader)
 template_environment.globals["url_path_for"] = app.url_path_for
 template_environment.globals["key_hash"] = _key_hash
 template_environment.globals["get_items_names"] = _get_items_names
+
+CONTENT_INDEX_HASH: dict[str, tuple[GuideType, Path]] = {}
+GAMES_LIST: list[Game] = []
+GAMES_INDEX_SLUG: dict[str, Game] = {}
+
 
 if __name__ == "__main__":
     cli()
