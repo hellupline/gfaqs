@@ -350,28 +350,12 @@ def cli_download(system_names: list[str], game_names: list[str]) -> None:
         allowable_methods=["GET"],
     ) as session:
         session.headers.update(DEFAULT_HEADERS)
-        # _request(
-        #     session,
-        #     url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236/how-to-recruit-pokemon",
-        # )
-
-        # _download_guide_item(
-        #     session,
-        #     url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236",
-        # )
-        # _download_guide_item(
-        #     session,
-        #     url="https://gamefaqs.gamespot.com/snes/588741-super-metroid/faqs/29226",
-        # )
-        # _download_guide_item(
-        #     session,
-        #     url="https://gamefaqs.gamespot.com/ds/661226-pokemon-black-version-2/faqs/64482",
-        # )
-        # _download_guide_item(
-        #     session,
-        #     url="https://gamefaqs.gamespot.com/ds/920760-metroid-prime-hunters/faqs/78897",
-        # )
-
+        # _request(session, url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236/how-to-recruit-pokemon",)
+        # _download_guide_item(session, url="https://gamefaqs.gamespot.com/ds/661226-pokemon-black-version-2/faqs/64482",)
+        # _download_guide_item(session, url="https://gamefaqs.gamespot.com/ds/920760-metroid-prime-hunters/faqs/78897",)
+        # _download_guide_item(session, url="https://gamefaqs.gamespot.com/gba/921905-pokemon-emerald-version/faqs/77433",)
+        # _download_guide_item(session, url="https://gamefaqs.gamespot.com/snes/588741-super-metroid/faqs/29226",)
+        # _download_guide_item(session, url="https://gamefaqs.gamespot.com/switch/281230-pokemon-mystery-dungeon-rescue-team-dx/faqs/79236",)
         for game_system in map(GameSystem, system_names):
             url = f"https://gamefaqs.gamespot.com/{game_system.value}/category/999-all"
             for url in tqdm(
@@ -556,7 +540,7 @@ def _download_guide_item(session: CachedSession, url: str) -> None:
     q = _html_parse_from_request(r)
     if (html := q("div.ffaq.ffaqbody#faqwrap").html(method="html")) is not None:
         logger.info("%s is html with size=%d", url, len(html))
-        _save_guide_html(session, key=url, html=html)  # type: ignore
+        _save_guide_html(session, key=url, q=q)  # type: ignore
         return
     if (img_url := q("div#map_container img#gf_map").attr("src")) is not None:
         logger.info("%s contains image as %s", url, img_url)
@@ -583,24 +567,19 @@ def _save_guide_zip(url: str, data: bytes) -> None:
             filename.write_bytes(content_data)
 
 
-def _save_guide_html(session: CachedSession, key: str, html: str) -> Path:
-    q = PyQuery(html)
-    content = q("div.ftoc")
+def _save_guide_html(session: CachedSession, key: str, q: PyQuery) -> Path:
+    content = q("div.ffaq.ffaqbody#faqwrap")
     visited: set[str] = set()
-    url_data_map = {
-        visited_url: data
-        for url in sorted({_clean_url(tag.attrib["href"]) for tag in content("a")})
-        for visited_url, data in _download_html_guide_html(session, url=url, visited=visited)
-    }
+    url_data_map = {url: data for url, data in _get_html_guide_item_1(session, q=content, visited=visited)}
     url_map = {url: _html_url_key(url) for url in url_data_map.keys()}
-    for url, data in url_data_map.items():
-        data_q = PyQuery(data)
-        for tag in data_q("a"):
+    for url, item_content in url_data_map.items():
+        for tag in item_content("a"):
             if "href" not in tag.attrib:
                 continue
             with suppress(KeyError):
                 tag.attrib["href"] = _get_new_url(tag.attrib["href"], url_map=url_map)
-        _save_data(name="data.html", key=url, data=_as_html_data(data_q))
+
+        _save_data(name="data.html", key=url, data=_as_html_data(item_content))
     for tag in content("a"):
         if "href" not in tag.attrib:
             continue
@@ -610,39 +589,42 @@ def _save_guide_html(session: CachedSession, key: str, html: str) -> Path:
     return path / "data.html"
 
 
-def _download_html_guide_html(
+def _get_html_guide_item_1(
     session: CachedSession,
-    url: str,
+    q: PyQuery,
     visited: set[str],
-) -> Generator[tuple[str, bytes], None, None]:
-    if url in visited:
-        return
-    r = _request(session, url=url)
-    q = _html_parse_from_request(r)
-    content = q("div.ffaq.ffaqbody#faqwrap")
-    content("div.ftoc").remove()
-    url_path_map = {
-        url: _download_html_guide_image(session, url=url)
-        for url in sorted(_clean_url(tag.attrib["src"]) for tag in content("img"))
-    }
-    url_map = {url: str(path.relative_to(storage_path)) for url, path in url_path_map.items()}
-    for tag in content("img"):
-        tag.attrib["src"] = _get_new_url(tag.attrib["src"], url_map=url_map)
-    if content.html(method="html") is None:
-        raise Exception(url)
-    yield url, _as_html_data(content)
-    visited.add(url)
-    to_visit_urls = sorted({_clean_url(tag.attrib["href"]) for tag in content("a") if "href" in tag.attrib})
-    for to_visit_url in to_visit_urls:
-        if to_visit_url in INVALID_URLS:
+) -> Generator[tuple[str, PyQuery], None, None]:
+    urls = sorted({_clean_url(tag.attrib["href"]) for tag in q("a") if "href" in tag.attrib})
+    for url in urls:
+        if url in INVALID_URLS:
             continue
         try:
-            yield from _download_html_guide_html(session=session, url=to_visit_url, visited=visited)
+            yield from _get_html_guide_item_2(session=session, url=url, visited=visited)
         except (HTTPError,) as e:
             match e.response:
                 case Response(status_code=codes.not_found):
                     continue
             raise
+
+
+def _get_html_guide_item_2(
+    session: CachedSession,
+    url: str,
+    visited: set[str],
+) -> Generator[tuple[str, PyQuery], None, None]:
+    if url in visited:
+        return
+    r = _request(session, url=url)
+    q = _html_parse_from_request(r)
+    content = q("div.ffaq.ffaqbody#faqwrap")
+    urls = sorted(_clean_url(tag.attrib["src"]) for tag in content("img"))
+    url_path_map = {url: _download_html_guide_image(session, url=url) for url in urls}
+    url_map = {url: str(path.relative_to(storage_path)) for url, path in url_path_map.items()}
+    for tag in content("img"):
+        tag.attrib["src"] = _get_new_url(tag.attrib["src"], url_map=url_map)
+    yield url, content
+    visited.add(url)
+    yield from _get_html_guide_item_1(session=session, q=content, visited=visited)
 
 
 def _download_html_guide_image(session: CachedSession, url: str) -> Path:
@@ -850,9 +832,10 @@ def game_guide(slug: str, key: str) -> str:
                         for tag in q("a"):
                             if "href" not in tag.attrib:
                                 continue
-                            item_key = Path(tag.attrib["href"]).parent.stem
+                            parsed = urlparse(tag.attrib["href"])
+                            item_key = Path(parsed.path).parent.stem
                             url = app.url_path_for("game_guide", slug=slug, key=item_key)
-                            tag.attrib["href"] = url
+                            tag.attrib["href"] = parsed._replace(path=url).geturl()
                         for tag in q("img"):
                             path = tag.attrib["src"]
                             url = app.url_path_for("data_storage", path=path)
